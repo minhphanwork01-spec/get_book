@@ -495,6 +495,7 @@ def main() -> None:
         render_downloads()
         render_logs()
 
+with tabs[4]:
     render_downloads()
     render_logs()
 
