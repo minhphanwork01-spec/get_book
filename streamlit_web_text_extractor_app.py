@@ -461,14 +461,13 @@ def tab_upload_html() -> None:
         except Exception as exc:
             st.error(f"ERROR: {exc}")
 
-
 def main() -> None:
     init_state()
 
     st.title("📚 Web Text Extractor")
     st.markdown(
         """
-        Tool extract text/content từ web truyện hoặc article HTML. 
+        Tool extract text/content từ web truyện hoặc article HTML.
         Bản này xử lý case Truyenfull-like: `#total-page`, `/trang-N/`, `#list-chapter`, `.chapter-c`.
         """
     )
@@ -485,12 +484,16 @@ def main() -> None:
 
     with tabs[0]:
         tab_full_novel(settings)
+
     with tabs[1]:
         tab_single_chapter(settings)
+
     with tabs[2]:
         tab_urls_file(settings)
+
     with tabs[3]:
         tab_upload_html()
+
     with tabs[4]:
         render_downloads()
         render_logs()
