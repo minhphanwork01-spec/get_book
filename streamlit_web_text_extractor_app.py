@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Streamlit Web Text Extractor v8
+Streamlit Web Text Extractor v9
 
 Main file for Streamlit Cloud:
-    streamlit_web_text_extractor_app_v8.py
+    streamlit_web_text_extractor_app_v9.py
 
 Files required:
-    streamlit_web_text_extractor_app_v8.py
-    web_text_extractor_core_v8.py
+    streamlit_web_text_extractor_app_v9.py
+    web_text_extractor_core_v9.py
     requirements.txt
 """
 
@@ -29,15 +29,18 @@ from pathlib import Path
 
 import streamlit as st
 
-from web_text_extractor_core_v8 import (
+from web_text_extractor_core_v9 import (
     CrawlResult,
     ExtractedPage,
+    GenericSourceConfig,
     append_jsonl,
     atomic_write_json,
     build_session,
     chapter_json_path,
     discover_chapter_urls,
+    discover_chapter_urls_generic,
     extract_from_html,
+    extract_from_html_generic,
     fetch_html,
     load_saved_chapter_files,
     natural_chapter_key,
@@ -51,11 +54,11 @@ from web_text_extractor_core_v8 import (
 )
 
 
-APP_VERSION = "fixed-v8-multithread-range-checkpoint"
+APP_VERSION = "v9-generic-html-multithread-range-checkpoint"
 DEFAULT_NOVEL_URL = "https://truyenfull.today/trung-sinh-chi-nha-noi/"
 
 
-st.set_page_config(page_title="Web Text Extractor v8", page_icon="📚", layout="wide")
+st.set_page_config(page_title="Web Text Extractor v9", page_icon="📚", layout="wide")
 
 
 # =========================
@@ -337,13 +340,35 @@ def sidebar_settings() -> dict:
 # Discovery and target range
 # =========================
 
-def discover_or_load_urls(novel_url: str, workspace: Path, settings: dict):
+def discover_or_load_urls(
+    novel_url: str,
+    workspace: Path,
+    settings: dict,
+    source_mode: str,
+    generic_config: GenericSourceConfig | None = None,
+):
     paths = get_paths(workspace)
     ckpt = read_checkpoint(workspace)
 
-    clean_novel_url = normalize_novel_url(novel_url)
+    if source_mode == "Generic HTML":
+        clean_novel_url = normalize_url(novel_url)
+        source_config_dict = asdict(generic_config) if generic_config else {}
+    else:
+        clean_novel_url = normalize_novel_url(novel_url)
+        source_config_dict = {}
 
     if ckpt and ckpt.get("novel_url") == clean_novel_url and ckpt.get("chapter_urls"):
+        if ckpt.get("source_mode", "Truyenfull-like") != source_mode:
+            raise RuntimeError(
+                "Current workspace belongs to another source mode. "
+                "Use New workspace or restore the matching checkpoint."
+            )
+        if source_mode == "Generic HTML" and ckpt.get("source_config", {}) != source_config_dict:
+            raise RuntimeError(
+                "Generic source settings differ from the current checkpoint. "
+                "Use New workspace if you intentionally changed selectors."
+            )
+
         log_line("Using chapter URLs from existing checkpoint.")
         return (
             ckpt.get("title", "Exported Book"),
@@ -366,23 +391,43 @@ def discover_or_load_urls(novel_url: str, workspace: Path, settings: dict):
         status.info(f"{stage}: {current}/{total} | {message}")
         log_line(f"{stage}: {current}/{total} | {message}")
 
-    title, author, index_pages, chapter_urls = discover_chapter_urls(
-        novel_url=clean_novel_url,
-        session=session,
-        timeout=settings["timeout"],
-        retries=settings["retries"],
-        delay=settings["index_delay"],
-        max_index_pages=0,
-        progress_callback=progress_callback,
-    )
+    if source_mode == "Generic HTML":
+        if generic_config is None:
+            raise RuntimeError("Generic source config is missing.")
 
-    if settings["sort_mode"] == "natural":
-        chapter_urls = sorted(chapter_urls, key=natural_chapter_key)
+        title, author, index_pages, chapter_urls = discover_chapter_urls_generic(
+            index_url=clean_novel_url,
+            session=session,
+            config=generic_config,
+            timeout=settings["timeout"],
+            retries=settings["retries"],
+            delay=settings["index_delay"],
+            progress_callback=progress_callback,
+        )
+
+        # Generic sites often use opaque numeric IDs in URLs. The order shown
+        # by the index is usually more trustworthy than sorting those IDs.
+        log_line("Generic mode keeps chapter discovery order.")
+    else:
+        title, author, index_pages, chapter_urls = discover_chapter_urls(
+            novel_url=clean_novel_url,
+            session=session,
+            timeout=settings["timeout"],
+            retries=settings["retries"],
+            delay=settings["index_delay"],
+            max_index_pages=0,
+            progress_callback=progress_callback,
+        )
+
+        if settings["sort_mode"] == "natural":
+            chapter_urls = sorted(chapter_urls, key=natural_chapter_key)
 
     paths["chapter_urls"].write_text("\n".join(chapter_urls) + "\n", encoding="utf-8")
 
     ckpt = {
         "app_version": APP_VERSION,
+        "source_mode": source_mode,
+        "source_config": source_config_dict,
         "novel_url": clean_novel_url,
         "title": title,
         "author": author,
@@ -427,7 +472,15 @@ def build_target_pairs(chapter_urls: list[str], settings: dict, existing_indices
 # Threaded fetch
 # =========================
 
-def fetch_one_chapter_worker(global_index: int, url: str, workspace_str: str, settings: dict) -> dict:
+def fetch_one_chapter_worker(
+    global_index: int,
+    url: str,
+    workspace_str: str,
+    settings: dict,
+    source_mode: str,
+    source_config_dict: dict,
+    fallback_book_title: str,
+) -> dict:
     workspace = Path(workspace_str)
     paths = get_paths(workspace)
     chapter_dir = paths["chapters_dir"]
@@ -461,7 +514,17 @@ def fetch_one_chapter_worker(global_index: int, url: str, workspace_str: str, se
         retries=int(settings.get("retries", 3)),
     )
 
-    page = extract_from_html(html, clean_url)
+    if source_mode == "Generic HTML":
+        config = GenericSourceConfig(**source_config_dict)
+        page = extract_from_html_generic(
+            html,
+            clean_url,
+            config,
+            fallback_book_title=fallback_book_title,
+        )
+    else:
+        page = extract_from_html(html, clean_url)
+
     path = save_chapter_json_atomic(chapter_dir, global_index, page)
 
     return {
@@ -474,17 +537,34 @@ def fetch_one_chapter_worker(global_index: int, url: str, workspace_str: str, se
     }
 
 
-def run_threaded_crawl(novel_url: str, settings: dict) -> CrawlResult:
+def run_threaded_crawl(
+    novel_url: str,
+    settings: dict,
+    source_mode: str,
+    generic_config: GenericSourceConfig | None = None,
+) -> CrawlResult:
     workspace = get_workspace()
     paths = get_paths(workspace)
     paths["chapters_dir"].mkdir(parents=True, exist_ok=True)
 
-    clean_novel_url = normalize_novel_url(novel_url)
+    if source_mode == "Generic HTML":
+        clean_novel_url = normalize_url(novel_url)
+        source_config_dict = asdict(generic_config) if generic_config else {}
+    else:
+        clean_novel_url = normalize_novel_url(novel_url)
+        source_config_dict = {}
 
     log_line(f"Workspace: {workspace}")
+    log_line(f"Source mode: {source_mode}")
     log_line("Discovering or loading chapter URLs...")
 
-    title, author, index_pages, chapter_urls = discover_or_load_urls(clean_novel_url, workspace, settings)
+    title, author, index_pages, chapter_urls = discover_or_load_urls(
+        clean_novel_url,
+        workspace,
+        settings,
+        source_mode,
+        generic_config,
+    )
 
     existing_indices = saved_global_indices(paths["chapters_dir"])
     target_pairs = build_target_pairs(chapter_urls, settings, existing_indices)
@@ -492,6 +572,8 @@ def run_threaded_crawl(novel_url: str, settings: dict) -> CrawlResult:
     ckpt = read_checkpoint(workspace)
     ckpt.update({
         "app_version": APP_VERSION,
+        "source_mode": source_mode,
+        "source_config": source_config_dict,
         "novel_url": clean_novel_url,
         "title": title,
         "author": author,
@@ -508,8 +590,8 @@ def run_threaded_crawl(novel_url: str, settings: dict) -> CrawlResult:
     write_checkpoint(workspace, ckpt)
 
     st.info(
-        f"Total chapters found: {len(chapter_urls)} | Already saved: {len(existing_indices)} | "
-        f"Will fetch this run: {len(target_pairs)}"
+        f"Mode: {source_mode} | Total chapters found: {len(chapter_urls)} | "
+        f"Already saved: {len(existing_indices)} | Will fetch this run: {len(target_pairs)}"
     )
 
     if not target_pairs:
@@ -527,7 +609,16 @@ def run_threaded_crawl(novel_url: str, settings: dict) -> CrawlResult:
 
     with ThreadPoolExecutor(max_workers=settings["workers"]) as executor:
         future_map = {
-            executor.submit(fetch_one_chapter_worker, idx, url, str(workspace), settings): (idx, url)
+            executor.submit(
+                fetch_one_chapter_worker,
+                idx,
+                url,
+                str(workspace),
+                settings,
+                source_mode,
+                source_config_dict,
+                title,
+            ): (idx, url)
             for idx, url in target_pairs
         }
 
@@ -806,15 +897,132 @@ def tab_full_novel(settings: dict) -> None:
     st.header("Full novel crawler")
 
     st.info(
-        "v8 dùng đa luồng + range + checkpoint. Mỗi chương OK được lưu ngay thành "
-        "`chapters/000001.json`, nên export/resume không phụ thuộc RAM."
+        "v9 keeps the existing Truyenfull-like crawler and adds Generic HTML mode. "
+        "Every successful chapter is still saved immediately as chapters/000001.json, "
+        "so resume/export remains checkpoint-based rather than RAM-based."
     )
 
-    novel_url = st.text_input(
-        "Novel/index URL",
-        value=DEFAULT_NOVEL_URL,
-        help="Link tiên đề/index của truyện, không phải link chương. Ví dụ https://truyenfull.today/trung-sinh-chi-nha-noi/",
+    workspace = get_workspace()
+    stored_ckpt = read_checkpoint(workspace)
+    stored_mode = stored_ckpt.get("source_mode", "Truyenfull-like") if stored_ckpt else "Truyenfull-like"
+    mode_options = ["Truyenfull-like", "Generic HTML"]
+    mode_index = mode_options.index(stored_mode) if stored_mode in mode_options else 0
+
+    source_mode = st.selectbox(
+        "Source mode",
+        mode_options,
+        index=mode_index,
+        help=(
+            "Truyenfull-like keeps the old /trang-N/ + /chuong- logic. "
+            "Generic HTML discovers chapter links with CSS selectors and keeps index discovery order."
+        ),
     )
+
+    stored_generic = stored_ckpt.get("source_config", {}) if stored_ckpt else {}
+
+    if source_mode == "Generic HTML":
+        st.markdown("### Generic HTML selectors")
+        st.caption(
+            "Use this only for sites/content you are permitted to fetch. "
+            "The crawler does not add login, cookie, paywall or anti-bot bypass."
+        )
+
+        g1, g2 = st.columns(2)
+        with g1:
+            novel_url = st.text_input(
+                "Index / table-of-contents URL",
+                value=stored_ckpt.get("novel_url", "") if stored_mode == "Generic HTML" else "",
+                help="Page containing chapter links, or the first page of a paginated chapter index.",
+                key="generic_novel_url_v9",
+            )
+            chapter_link_selector = st.text_input(
+                "Chapter link CSS selector",
+                value=stored_generic.get("chapter_link_selector", ""),
+                placeholder=".chapter-list a[href]",
+                key="generic_chapter_link_selector_v9",
+            )
+            content_selector = st.text_input(
+                "Chapter content CSS selector",
+                value=stored_generic.get("content_selector", ""),
+                placeholder="#content or .chapter-content",
+                help="May match one content container or multiple paragraph nodes.",
+                key="generic_content_selector_v9",
+            )
+            chapter_title_selector = st.text_input(
+                "Chapter title CSS selector (optional)",
+                value=stored_generic.get("chapter_title_selector", ""),
+                placeholder="h1",
+                key="generic_chapter_title_selector_v9",
+            )
+
+        with g2:
+            book_title_selector = st.text_input(
+                "Book title CSS selector (optional)",
+                value=stored_generic.get("book_title_selector", ""),
+                placeholder="h1.book-title",
+                key="generic_book_title_selector_v9",
+            )
+            author_selector = st.text_input(
+                "Author CSS selector (optional)",
+                value=stored_generic.get("author_selector", ""),
+                placeholder=".author",
+                key="generic_author_selector_v9",
+            )
+            pagination_selector = st.text_input(
+                "Index pagination link selector (optional)",
+                value=stored_generic.get("pagination_selector", ""),
+                placeholder=".pagination a[href]",
+                help=(
+                    "Leave blank when the whole chapter list is on one index page. "
+                    "When set, v9 follows matching same-origin index links breadth-first."
+                ),
+                key="generic_pagination_selector_v9",
+            )
+            same_origin_only = st.checkbox(
+                "Same-origin links only",
+                value=bool(stored_generic.get("same_origin_only", True)),
+                key="generic_same_origin_v9",
+                help="Recommended for public deployments. Prevents chapter/pagination selectors from jumping to other domains.",
+            )
+            max_index_pages = int(st.number_input(
+                "Max index pages",
+                min_value=1,
+                max_value=10000,
+                value=int(stored_generic.get("max_index_pages", 100)),
+                step=1,
+                key="generic_max_index_pages_v9",
+            ))
+
+        generic_config = GenericSourceConfig(
+            chapter_link_selector=chapter_link_selector.strip(),
+            content_selector=content_selector.strip(),
+            chapter_title_selector=chapter_title_selector.strip(),
+            book_title_selector=book_title_selector.strip(),
+            author_selector=author_selector.strip(),
+            pagination_selector=pagination_selector.strip(),
+            same_origin_only=bool(same_origin_only),
+            max_index_pages=max_index_pages,
+        )
+
+        st.warning(
+            "Generic mode keeps chapter links in discovery order. "
+            "The sidebar 'Chapter order' setting only applies to Truyenfull-like mode."
+        )
+    else:
+        generic_config = None
+        novel_url = st.text_input(
+            "Novel/index URL",
+            value=(
+                stored_ckpt.get("novel_url", DEFAULT_NOVEL_URL)
+                if stored_mode == "Truyenfull-like"
+                else DEFAULT_NOVEL_URL
+            ),
+            help=(
+                "Link tiên đề/index của truyện, không phải link chương. "
+                "Ví dụ https://truyenfull.today/trung-sinh-chi-nha-noi/"
+            ),
+            key="truyenfull_novel_url_v9",
+        )
 
     uploaded = st.file_uploader(
         "Restore checkpoint ZIP",
@@ -823,11 +1031,16 @@ def tab_full_novel(settings: dict) -> None:
     )
 
     if uploaded is not None:
-        if st.button("Restore uploaded checkpoint", type="secondary", help="Giải nén checkpoint ZIP vào workspace mới rồi dùng nó để resume."):
+        if st.button(
+            "Restore uploaded checkpoint",
+            type="secondary",
+            help="Giải nén checkpoint ZIP vào workspace mới rồi dùng nó để resume.",
+        ):
             try:
-                workspace = restore_checkpoint_zip(uploaded)
-                st.success(f"Restored checkpoint to workspace: {workspace}")
-                log_line(f"Restored checkpoint: {workspace}")
+                restored_workspace = restore_checkpoint_zip(uploaded)
+                st.success(f"Restored checkpoint to workspace: {restored_workspace}")
+                log_line(f"Restored checkpoint: {restored_workspace}")
+                st.rerun()
             except Exception as exc:
                 st.error(f"Restore ERROR: {type(exc).__name__}: {exc}")
                 st.code(traceback.format_exc(), language="python")
@@ -839,21 +1052,21 @@ def tab_full_novel(settings: dict) -> None:
             "Start / Resume selected range",
             type="primary",
             use_container_width=True,
-            help="Bắt đầu crawl range đã chọn. Nếu chương đã có file JSON thì app sẽ skip, không chạy lại từ đầu.",
+            help="Bắt đầu crawl range đã chọn. File JSON đã có sẽ được skip.",
         )
 
     with c2:
         export_now = st.button(
             "Export current checkpoint",
             use_container_width=True,
-            help="Xuất TXT/EPUB từ các chương đã lưu hiện tại, kể cả khi chưa crawl xong full truyện.",
+            help="Xuất TXT/EPUB từ các chương đã lưu hiện tại.",
         )
 
     with c3:
         reset_workspace = st.button(
             "New workspace",
             use_container_width=True,
-            help="Tạo workspace mới, dùng khi muốn crawl truyện/range mới từ đầu. Không bấm nếu bạn muốn resume checkpoint hiện tại.",
+            help="Tạo workspace mới khi đổi truyện/source/selectors.",
         )
 
     if reset_workspace:
@@ -861,6 +1074,9 @@ def tab_full_novel(settings: dict) -> None:
         st.session_state.last_files = {}
         st.session_state.last_zip = None
         reset_logs()
+        for key in list(st.session_state.keys()):
+            if key.startswith("generic_") or key == "truyenfull_novel_url_v9":
+                del st.session_state[key]
         st.rerun()
 
     workspace = get_workspace()
@@ -876,10 +1092,23 @@ def tab_full_novel(settings: dict) -> None:
             st.code(traceback.format_exc(), language="python")
 
     if start:
+        if source_mode == "Generic HTML":
+            if not novel_url.strip():
+                st.error("Generic mode requires an index URL.")
+                return
+            if not generic_config.chapter_link_selector:
+                st.error("Generic mode requires a Chapter link CSS selector.")
+                return
+
         reset_logs()
         try:
             with st.spinner("Crawling selected range with threads..."):
-                result = run_threaded_crawl(novel_url, settings)
+                result = run_threaded_crawl(
+                    novel_url,
+                    settings,
+                    source_mode,
+                    generic_config,
+                )
                 export_current_workspace(settings)
 
             st.success(
@@ -968,6 +1197,32 @@ Nếu app reset hẳn và mất workspace, upload `checkpoint_workspace.zip` đ�
 ### Khi nào nên tải checkpoint ZIP?
 
 Nên tải sau mỗi batch hoặc sau vài trăm chương. Streamlit Cloud có thể reset process, nên checkpoint ZIP là cách giữ dữ liệu ngoài server tạm.
+
+### Generic HTML mode
+
+Dùng mode này khi source không có cấu trúc `/trang-N/` và `/chuong-N/` kiểu Truyenfull.
+
+Cần tối thiểu:
+
+- **Index / table-of-contents URL**: trang chứa link chương.
+- **Chapter link CSS selector**: selector trỏ tới các thẻ `<a href=...>` của chương.
+- **Chapter content CSS selector**: selector vùng正文/nội dung chương.
+
+Tùy chọn:
+
+- `Chapter title selector` để lấy tiêu đề chương chính xác.
+- `Book title selector` và `Author selector` cho metadata.
+- `Index pagination selector` nếu mục lục chia nhiều trang.
+
+Generic mode giữ **discovery order** của index thay vì sort số trong URL, vì nhiều site dùng opaque chapter IDs.
+
+Workflow nên dùng:
+
+1. `Max chapters this run = 5`.
+2. Workers = 2–4.
+3. Chạy thử và kiểm tra Raw chapters/TXT.
+4. Nếu đúng mới nâng range.
+5. Với sách tiếng Trung, đổi `EPUB language` ở sidebar thành `zh-CN`.
         """
     )
 
