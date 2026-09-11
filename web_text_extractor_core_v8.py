@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-web_text_extractor_core_v8.py
+web_text_extractor_core_v9.py
 
-Core library for Streamlit Web Text Extractor v8.
+Core library for Streamlit Web Text Extractor v9.
 
 Main features:
 - Truyenfull-like discovery:
@@ -13,13 +13,17 @@ Main features:
 - URL fragment removal: /trang-2/#list-chapter -> /trang-2/
 - Manual EPUB generator, no EbookLib dependency
 - Atomic per-chapter JSON output support
+- Generic HTML source mode with configurable CSS selectors
+- Public-URL validation and safe redirect handling for public deployments
 """
 
 from __future__ import annotations
 
 import html as html_lib
+import ipaddress
 import json
 import random
+import socket
 import re
 import time
 import unicodedata
@@ -60,6 +64,18 @@ class CrawlResult:
     failed_urls: list[dict] = field(default_factory=list)
 
 
+@dataclass
+class GenericSourceConfig:
+    chapter_link_selector: str
+    content_selector: str
+    chapter_title_selector: str = ""
+    book_title_selector: str = ""
+    author_selector: str = ""
+    pagination_selector: str = ""
+    same_origin_only: bool = True
+    max_index_pages: int = 100
+
+
 ProgressCallback = Optional[Callable[[str, int, int, str], None]]
 
 
@@ -88,6 +104,69 @@ def normalize_url(url: str) -> str:
         path=path,
         fragment="",
     ).geturl()
+
+
+def _public_ip_for_host(host: str) -> bool:
+    if not host or host.lower() in {"localhost", "localhost.localdomain"}:
+        return False
+
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise RuntimeError(f"Cannot resolve host: {host}") from exc
+
+    if not infos:
+        return False
+
+    for info in infos:
+        raw = info[4][0].split("%", 1)[0]
+        ip = ipaddress.ip_address(raw)
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return False
+    return True
+
+
+def validate_public_http_url(url: str) -> str:
+    url = normalize_url(url)
+    parsed = urlparse(url)
+
+    if parsed.scheme not in {"http", "https"}:
+        raise RuntimeError("Only http/https URLs are allowed.")
+    if not parsed.hostname:
+        raise RuntimeError("URL has no valid hostname.")
+    if parsed.username or parsed.password:
+        raise RuntimeError("Credentials embedded in URL are not allowed.")
+    if not _public_ip_for_host(parsed.hostname):
+        raise RuntimeError("Private/loopback/link-local/reserved hosts are blocked.")
+
+    return url
+
+
+def same_origin(a: str, b: str) -> bool:
+    pa = urlparse(normalize_url(a))
+    pb = urlparse(normalize_url(b))
+
+    def effective_port(p):
+        if p.port:
+            return p.port
+        return 443 if p.scheme == "https" else 80
+
+    return (
+        pa.scheme.lower(),
+        (pa.hostname or "").lower(),
+        effective_port(pa),
+    ) == (
+        pb.scheme.lower(),
+        (pb.hostname or "").lower(),
+        effective_port(pb),
+    )
 
 
 def normalize_novel_url(url: str) -> str:
@@ -288,14 +367,42 @@ def fetch_html(
     timeout: int = 30,
     retries: int = 3,
     sleep_on_retry: float = 2.0,
+    max_redirects: int = 5,
 ) -> str:
-    url = normalize_url(url)
+    start_url = validate_public_http_url(url)
     last_error: Optional[Exception] = None
 
     for attempt in range(1, retries + 1):
         try:
-            response = session.get(url, timeout=timeout)
+            current = start_url
+            response = None
+
+            for _redirect_no in range(max_redirects + 1):
+                current = validate_public_http_url(current)
+                response = session.get(current, timeout=timeout, allow_redirects=False)
+
+                if 300 <= response.status_code < 400 and response.headers.get("Location"):
+                    location = response.headers["Location"]
+                    next_url = normalize_url(urljoin(current, location))
+                    response.close()
+                    current = validate_public_http_url(next_url)
+                    continue
+
+                break
+            else:
+                raise RuntimeError(f"Too many redirects for {start_url}")
+
+            if response is None:
+                raise RuntimeError(f"No response for {start_url}")
+
             response.raise_for_status()
+
+            content_type = (response.headers.get("content-type") or "").lower()
+            if content_type and not any(
+                x in content_type
+                for x in ("text/html", "application/xhtml+xml", "text/plain")
+            ):
+                raise RuntimeError(f"Unexpected content type: {content_type}")
 
             if response.apparent_encoding:
                 response.encoding = response.apparent_encoding
@@ -307,7 +414,7 @@ def fetch_html(
             if attempt < retries:
                 time.sleep(sleep_on_retry * attempt)
 
-    raise RuntimeError(f"Failed to fetch {url}: {last_error}") from last_error
+    raise RuntimeError(f"Failed to fetch {start_url}: {last_error}") from last_error
 
 
 # =========================
@@ -484,6 +591,66 @@ def extract_from_html(html: str, url: str = "") -> ExtractedPage:
     )
 
 
+def _select_text(soup: BeautifulSoup, selector: str) -> str:
+    selector = (selector or "").strip()
+    if not selector:
+        return ""
+    node = soup.select_one(selector)
+    if not isinstance(node, Tag):
+        return ""
+    return normalize_whitespace(node.get_text(" ", strip=True))
+
+
+def extract_from_html_generic(
+    html: str,
+    url: str,
+    config: GenericSourceConfig,
+    fallback_book_title: str = "",
+) -> ExtractedPage:
+    soup = make_soup(html)
+
+    selector = (config.content_selector or "").strip()
+    if selector:
+        nodes = [node for node in soup.select(selector) if isinstance(node, Tag)]
+        if not nodes:
+            raise ValueError(f"Cannot find content selector {selector!r} in {url}")
+        parts = [text_from_html_block(node) for node in nodes]
+        content = "\n\n".join(part for part in parts if part.strip()).strip()
+        source_selector = selector
+    else:
+        block, source_selector = select_best_content_block(soup)
+        if block is None:
+            raise ValueError(f"Cannot find main content block in {url}")
+        content = text_from_html_block(block)
+
+    if not content:
+        raise ValueError(f"Extracted content is empty in {url}")
+
+    chapter_title = _select_text(soup, config.chapter_title_selector)
+    if not chapter_title:
+        chapter_title = pick_meta_content(soup, [{"property": "og:title"}])
+        if not chapter_title and soup.title:
+            chapter_title = normalize_whitespace(soup.title.get_text(" ", strip=True))
+
+    book_title = _select_text(soup, config.book_title_selector) or fallback_book_title
+    title = " - ".join(x for x in [book_title, chapter_title] if x).strip(" -")
+    if not title:
+        title = chapter_title or book_title or url
+
+    next_url = find_next_chapter_url(soup, url)
+
+    return ExtractedPage(
+        url=normalize_url(url),
+        title=title,
+        book_title=book_title,
+        chapter_title=chapter_title,
+        content=content,
+        next_url=next_url,
+        source_selector=source_selector,
+        content_chars=len(content),
+    )
+
+
 # =========================
 # Chapter list discovery
 # =========================
@@ -615,6 +782,138 @@ def discover_chapter_urls(
 
         if progress_callback:
             progress_callback("index", idx, len(index_pages), f"{clean_index_url} | chapters found: {len(chapter_urls)}")
+
+    return title, author, index_pages, list(chapter_urls.keys())
+
+
+def _generic_index_metadata(
+    html: str,
+    url: str,
+    config: GenericSourceConfig,
+) -> tuple[str, str]:
+    soup = make_soup(html)
+    title = _select_text(soup, config.book_title_selector)
+    author = _select_text(soup, config.author_selector)
+
+    if not title:
+        title, fallback_author = parse_index_metadata(html, url)
+        if not author:
+            author = fallback_author
+
+    return title or "Untitled", author
+
+
+def _generic_links_from_selector(
+    soup: BeautifulSoup,
+    page_url: str,
+    selector: str,
+    origin_url: str,
+    same_origin_only: bool,
+) -> list[str]:
+    urls: OrderedDict[str, None] = OrderedDict()
+
+    try:
+        nodes = soup.select(selector)
+    except Exception as exc:
+        raise ValueError(f"Invalid CSS selector {selector!r}: {exc}") from exc
+
+    for node in nodes:
+        if not isinstance(node, Tag):
+            continue
+        href = node.get("href")
+        if not href or str(href).lower().startswith(("javascript:", "mailto:", "#")):
+            continue
+
+        abs_url = normalize_url(urljoin(page_url, href))
+        try:
+            validate_public_http_url(abs_url)
+        except Exception:
+            continue
+
+        if same_origin_only and not same_origin(abs_url, origin_url):
+            continue
+
+        urls[abs_url] = None
+
+    return list(urls.keys())
+
+
+def discover_chapter_urls_generic(
+    index_url: str,
+    session: requests.Session,
+    config: GenericSourceConfig,
+    timeout: int = 30,
+    retries: int = 3,
+    delay: float = 0.5,
+    progress_callback: ProgressCallback = None,
+) -> tuple[str, str, list[str], list[str]]:
+    index_url = validate_public_http_url(index_url)
+
+    if not (config.chapter_link_selector or "").strip():
+        raise ValueError("Generic mode requires a chapter link CSS selector.")
+
+    first_html = fetch_html(session, index_url, timeout=timeout, retries=retries)
+    title, author = _generic_index_metadata(first_html, index_url, config)
+
+    queue: list[str] = [index_url]
+    queued: set[str] = {index_url}
+    visited: set[str] = set()
+    index_pages: list[str] = []
+    chapter_urls: OrderedDict[str, None] = OrderedDict()
+    html_cache: dict[str, str] = {index_url: first_html}
+    max_pages = max(1, int(config.max_index_pages or 1))
+
+    while queue and len(index_pages) < max_pages:
+        page_url = queue.pop(0)
+        if page_url in visited:
+            continue
+
+        visited.add(page_url)
+        index_pages.append(page_url)
+
+        if page_url in html_cache:
+            html = html_cache.pop(page_url)
+        else:
+            if delay > 0:
+                time.sleep(delay)
+            html = fetch_html(session, page_url, timeout=timeout, retries=retries)
+
+        soup = make_soup(html)
+
+        for chapter_url in _generic_links_from_selector(
+            soup,
+            page_url,
+            config.chapter_link_selector,
+            index_url,
+            config.same_origin_only,
+        ):
+            chapter_urls[chapter_url] = None
+
+        pagination_selector = (config.pagination_selector or "").strip()
+        if pagination_selector:
+            for pagination_url in _generic_links_from_selector(
+                soup,
+                page_url,
+                pagination_selector,
+                index_url,
+                config.same_origin_only,
+            ):
+                if pagination_url not in visited and pagination_url not in queued:
+                    queue.append(pagination_url)
+                    queued.add(pagination_url)
+
+        if progress_callback:
+            progress_callback(
+                "index",
+                len(index_pages),
+                max(len(index_pages) + len(queue), 1),
+                f"{page_url} | chapters found: {len(chapter_urls)}",
+            )
+
+    if not chapter_urls:
+        raise ValueError(
+            "Generic discovery found 0 chapter URLs. Check chapter link selector and same-origin setting."
+        )
 
     return title, author, index_pages, list(chapter_urls.keys())
 
